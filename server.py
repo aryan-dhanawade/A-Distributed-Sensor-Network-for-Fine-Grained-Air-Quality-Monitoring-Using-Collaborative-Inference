@@ -2,8 +2,9 @@
 ==============================================================
   Distributed AQI Monitoring System — SERVER
   DC Principles: Distributed Aggregation + Byzantine Agreement
+  Architecture : 6 nodes | 3 zones | 2 nodes per zone
+  Two-tier BFT : Intra-zone → Inter-zone
 ==============================================================
-  Run FIRST before starting any clients.
   Usage: python server.py
 """
 
@@ -12,29 +13,48 @@ import threading
 import json
 import time
 import statistics
-import math
 from datetime import datetime
 
 HOST = "127.0.0.1"
 PORT = 9999
-EXPECTED_CLIENTS = 4          # Wait for all 4 nodes before consensus
-BYZANTINE_THRESHOLD = 1.5     # IQR multiplier for outlier detection
-ROUNDS = 5                    # Number of sensing rounds
+EXPECTED_CLIENTS = 6
+
+# Zone assignment: node_index (1-6) -> zone name
+ZONE_MAP = {
+    1: "Zone-A (Andheri)",
+    2: "Zone-A (Andheri)",
+    3: "Zone-B (Bandra)",
+    4: "Zone-B (Bandra)",
+    5: "Zone-C (Powai)",
+    6: "Zone-C (Powai)",
+}
+ZONES = {
+    "Zone-A (Andheri)": [1, 2],
+    "Zone-B (Bandra)":  [3, 4],
+    "Zone-C (Powai)":   [5, 6],
+}
+
+# Intra-zone: max allowed PM2.5 difference between the 2 nodes in a zone
+INTRA_ZONE_DISAGREEMENT_THRESHOLD = 30.0  # µg/m³
+
+# Inter-zone: z-score threshold to flag an entire zone as Byzantine
+INTER_ZONE_ZSCORE_THRESHOLD = 1.8
+
+ROUNDS = 5
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 lock = threading.Lock()
-round_data: dict[int, dict] = {}   # round_id -> {client_id: reading_dict}
+round_data: dict[int, dict] = {}
 round_events: dict[int, threading.Event] = {}
 connected_clients: dict[int, socket.socket] = {}
 client_id_counter = 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  METRIC HELPERS
+#  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_aqi_from_pm25(pm25: float) -> float:
-    """Simple linear AQI estimation from PM2.5 (µg/m³)."""
     breakpoints = [
         (0.0,   12.0,   0,   50),
         (12.1,  35.4,  51,  100),
@@ -59,90 +79,136 @@ def aqi_category(aqi: float) -> str:
     return "Hazardous"
 
 
+def weighted_avg_metric(readings_list: list[dict], metric: str) -> float:
+    vals    = [r[metric] for r in readings_list]
+    noises  = [r.get("noise_level", 1.0) for r in readings_list]
+    weights = [1.0 / (1.0 + n) for n in noises]
+    total_w = sum(weights)
+    return round(sum(v * w for v, w in zip(vals, weights)) / total_w, 4)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  BYZANTINE AGREEMENT MODULE
-#  Uses IQR-based outlier rejection — a practical BFT approach for sensor nets.
-#  Any node whose reading lies beyond Q1 - k*IQR or Q3 + k*IQR is flagged.
+#  TIER 1 — INTRA-ZONE BYZANTINE AGREEMENT
+#
+#  With exactly 2 nodes per zone we cannot mathematically determine which node
+#  is lying (3f+1 requires ≥3 nodes to tolerate 1 fault).
+#  Strategy:
+#    • If nodes AGREE (|Δ PM2.5| ≤ threshold) → weighted aggregate, confidence=1.0
+#    • If nodes DISAGREE                       → plain average, confidence=0.5 (degraded)
+#    • If only 1 node reported                 → use it, confidence=0.5
+#    • If 0 nodes reported                     → confidence=0.0, status=no_data
 # ══════════════════════════════════════════════════════════════════════════════
 
-def byzantine_filter(readings: dict) -> tuple[dict, list]:
-    """
-    Returns (trusted_readings, byzantine_node_ids).
-    Works on PM2.5 values. Needs ≥ 4 nodes for meaningful BFT (3f+1 rule).
-    """
-    values = {cid: r["pm25"] for cid, r in readings.items()}
-    sorted_vals = sorted(values.values())
+def intra_zone_bft(zone_name: str, node_ids: list[int], readings: dict) -> dict:
+    present = {nid: readings[nid] for nid in node_ids if nid in readings}
+    metrics = ["pm25", "co", "no2", "o3"]
 
-    if len(sorted_vals) < 3:
-        return readings, []          # not enough nodes to judge
+    base = {"zone": zone_name, "node_ids": node_ids,
+            "zone_pm25": None, "zone_co": None, "zone_no2": None, "zone_o3": None}
 
-    q1 = statistics.quantiles(sorted_vals, n=4)[0]
-    q3 = statistics.quantiles(sorted_vals, n=4)[2]
-    iqr = q3 - q1
+    if len(present) == 0:
+        return {**base, "confidence": 0.0, "status": "no_data",
+                "byzantine_nodes": [], "intra_pm25_diff": None}
 
-    lower = q1 - BYZANTINE_THRESHOLD * iqr
-    upper = q3 + BYZANTINE_THRESHOLD * iqr
+    rlist = list(present.values())
 
-    trusted, byzantine = {}, []
-    for cid, r in readings.items():
-        if lower <= r["pm25"] <= upper:
-            trusted[cid] = r
+    if len(present) == 1:
+        r = rlist[0]
+        return {**base,
+                "zone_pm25": r["pm25"], "zone_co": r["co"],
+                "zone_no2":  r["no2"],  "zone_o3": r["o3"],
+                "confidence": 0.5, "status": "degraded",
+                "byzantine_nodes": [], "intra_pm25_diff": None}
+
+    # Both nodes present
+    diff = abs(rlist[0]["pm25"] - rlist[1]["pm25"])
+
+    if diff <= INTRA_ZONE_DISAGREEMENT_THRESHOLD:
+        # Agreement — weighted average
+        agg = {m: weighted_avg_metric(rlist, m) for m in metrics}
+        return {**base,
+                "zone_pm25": agg["pm25"], "zone_co": agg["co"],
+                "zone_no2":  agg["no2"],  "zone_o3": agg["o3"],
+                "confidence": 1.0, "status": "ok",
+                "byzantine_nodes": [], "intra_pm25_diff": round(diff, 4)}
+    else:
+        # Disagreement — plain average, mark degraded (can't tell who lied)
+        agg = {m: round(statistics.mean([r[m] for r in rlist]), 4) for m in metrics}
+        return {**base,
+                "zone_pm25": agg["pm25"], "zone_co": agg["co"],
+                "zone_no2":  agg["no2"],  "zone_o3": agg["o3"],
+                "confidence": 0.5, "status": "degraded",
+                "byzantine_nodes": [], "intra_pm25_diff": round(diff, 4)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TIER 2 — INTER-ZONE BYZANTINE AGREEMENT
+#
+#  Compare the 3 zone-level PM2.5 aggregates.
+#  A zone whose PM2.5 z-score exceeds the threshold means BOTH nodes in that
+#  zone are reporting bad data → drop the entire zone from city-wide aggregation.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def inter_zone_bft(zone_results: list[dict]) -> tuple[list[dict], list[str]]:
+    active = [z for z in zone_results if z["zone_pm25"] is not None]
+
+    if len(active) < 2:
+        return active, []
+
+    pm25_vals = [z["zone_pm25"] for z in active]
+
+    # With only 2 active zones use relative difference instead of z-score
+    if len(pm25_vals) == 2:
+        mean_v = statistics.mean(pm25_vals)
+        diff_pct = abs(pm25_vals[0] - pm25_vals[1]) / (mean_v + 1e-9)
+        if diff_pct > 0.6:
+            suspect = max(active, key=lambda z: z["zone_pm25"])
+            byzantine_zones = [suspect["zone"]]
+            trusted = [z for z in active if z["zone"] not in byzantine_zones]
+            return trusted, byzantine_zones
+        return active, []
+
+    # 3 active zones — z-score method
+    mean_v  = statistics.mean(pm25_vals)
+    stdev_v = statistics.stdev(pm25_vals)
+
+    trusted, byzantine_zones = [], []
+    for z in active:
+        z_score = abs(z["zone_pm25"] - mean_v) / (stdev_v + 1e-9)
+        if z_score > INTER_ZONE_ZSCORE_THRESHOLD:
+            byzantine_zones.append(z["zone"])
         else:
-            byzantine.append(cid)
+            trusted.append(z)
 
-    # Safety: always keep at least 1 node
-    if not trusted:
-        trusted = readings
-        byzantine = []
+    if not trusted:   # safety — never drop everything
+        return active, []
 
-    return trusted, byzantine
+    return trusted, byzantine_zones
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DISTRIBUTED AGGREGATION MODULE
-#  Weighted average across surviving (trusted) nodes.
-#  Weight = 1 / (1 + node_reported_noise_level)  so quieter sensors dominate.
+#  DISTRIBUTED AGGREGATION — CITY-WIDE
+#  Each trusted zone contributes proportionally to its confidence score.
+#  This is the final stage of the two-level distributed aggregation protocol.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def distributed_aggregate(trusted_readings: dict) -> dict:
-    """
-    Returns aggregated sensor values and per-metric statistics.
-    """
-    if not trusted_readings:
+def city_wide_aggregate(trusted_zones: list[dict]) -> dict:
+    if not trusted_zones:
         return {}
 
-    metrics = ["pm25", "co", "no2", "o3"]
-    aggregated = {}
-    weights = []
+    metrics    = ["pm25", "co", "no2", "o3"]
+    confs      = [z["confidence"] for z in trusted_zones]
+    total_c    = sum(confs)
+    norm_c     = [c / total_c for c in confs]
 
-    for r in trusted_readings.values():
-        noise = r.get("noise_level", 1.0)
-        weights.append(1.0 / (1.0 + noise))
-
-    total_w = sum(weights)
-    norm_weights = [w / total_w for w in weights]
-
-    readings_list = list(trusted_readings.values())
-
+    agg = {}
     for m in metrics:
-        vals = [r[m] for r in readings_list]
-        weighted_avg = sum(v * w for v, w in zip(vals, norm_weights))
-        aggregated[m] = {
-            "weighted_avg": round(weighted_avg, 4),
-            "mean":         round(statistics.mean(vals), 4),
-            "stdev":        round(statistics.stdev(vals), 4) if len(vals) > 1 else 0.0,
-            "min":          round(min(vals), 4),
-            "max":          round(max(vals), 4),
-        }
+        vals   = [z[f"zone_{m}"] for z in trusted_zones]
+        agg[m] = round(sum(v * w for v, w in zip(vals, norm_c)), 4)
 
-    # Derive consensus AQI from aggregated PM2.5
-    consensus_pm25 = aggregated["pm25"]["weighted_avg"]
-    consensus_aqi  = compute_aqi_from_pm25(consensus_pm25)
-    aggregated["consensus_aqi"]      = consensus_aqi
-    aggregated["aqi_category"]       = aqi_category(consensus_aqi)
-    aggregated["participating_nodes"] = len(trusted_readings)
-
-    return aggregated
+    agg["consensus_aqi"] = compute_aqi_from_pm25(agg["pm25"])
+    agg["aqi_category"]  = aqi_category(agg["consensus_aqi"])
+    return agg
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -150,68 +216,91 @@ def distributed_aggregate(trusted_readings: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_consensus_round(round_id: int):
-    t_start = time.time()
-    readings = round_data[round_id]
+    t_start  = time.time()
+    readings = {k: v for k, v in round_data[round_id].items()
+                if k != "_done" and isinstance(k, int)}
 
-    raw_pm25_values = [r["pm25"] for r in readings.values()]
-    naive_avg_pm25  = statistics.mean(raw_pm25_values)
-    naive_aqi       = compute_aqi_from_pm25(naive_avg_pm25)
+    # Naive AQI — raw average, no filtering
+    raw_pm25  = [r["pm25"] for r in readings.values()]
+    naive_aqi = compute_aqi_from_pm25(statistics.mean(raw_pm25))
 
-    # ── Step 1: Byzantine Agreement ──────────────────────────────────────────
-    trusted, byzantine_ids = byzantine_filter(readings)
+    # ── TIER 1: Intra-zone BFT + aggregation ─────────────────────────────────
+    zone_results = [intra_zone_bft(zname, nids, readings)
+                    for zname, nids in ZONES.items()]
 
-    # ── Step 2: Distributed Aggregation ──────────────────────────────────────
-    aggregated = distributed_aggregate(trusted)
+    # ── TIER 2: Inter-zone BFT ────────────────────────────────────────────────
+    trusted_zones, byzantine_zone_names = inter_zone_bft(zone_results)
+
+    # ── City-wide distributed aggregation ────────────────────────────────────
+    city = city_wide_aggregate(trusted_zones)
 
     latency_ms = round((time.time() - t_start) * 1000, 2)
 
-    # ── Step 3: Per-node deviation stats ─────────────────────────────────────
-    consensus_pm25 = aggregated["pm25"]["weighted_avg"]
-    node_deviations = {}
-    for cid, r in readings.items():
-        dev = round(abs(r["pm25"] - consensus_pm25), 4)
-        node_deviations[cid] = {
-            "pm25":        r["pm25"],
-            "deviation":   dev,
-            "is_byzantine": cid in byzantine_ids,
-            "location":    r.get("location", "unknown"),
-        }
-
-    # ── Step 4: Print server-side report ─────────────────────────────────────
-    sep = "═" * 60
+    # ── PRINT REPORT ─────────────────────────────────────────────────────────
+    sep = "═" * 68
     print(f"\n{sep}")
-    print(f"  ROUND {round_id} CONSENSUS REPORT  [{datetime.now().strftime('%H:%M:%S')}]")
+    print(f"  ROUND {round_id} — TWO-TIER CONSENSUS REPORT  [{datetime.now().strftime('%H:%M:%S')}]")
     print(sep)
-    print(f"  Nodes received    : {len(readings)}")
-    print(f"  Byzantine nodes   : {len(byzantine_ids)}  {byzantine_ids if byzantine_ids else ''}")
-    print(f"  Trusted nodes     : {len(trusted)}")
-    print(f"  Naive AQI (no BFT): {naive_aqi}  ({aqi_category(naive_aqi)})")
-    print(f"  Consensus AQI     : {aggregated['consensus_aqi']}  ({aggregated['aqi_category']})")
-    print(f"  Round latency     : {latency_ms} ms")
-    print()
-    print(f"  {'Node':<8} {'Location':<18} {'PM2.5':>7} {'Deviation':>10} {'Status'}")
-    print(f"  {'-'*8} {'-'*18} {'-'*7} {'-'*10} {'-'*12}")
-    for cid, info in node_deviations.items():
-        status = "⚠ BYZANTINE" if info["is_byzantine"] else "✓ trusted"
-        print(f"  Node-{cid:<3} {info['location']:<18} {info['pm25']:>7.2f} {info['deviation']:>10.4f}  {status}")
-    print()
-    print(f"  Aggregated PM2.5 : {aggregated['pm25']['weighted_avg']} µg/m³  "
-          f"(σ={aggregated['pm25']['stdev']})")
-    print(f"  Aggregated CO    : {aggregated['co']['weighted_avg']} ppm")
-    print(f"  Aggregated NO2   : {aggregated['no2']['weighted_avg']} ppb")
-    print(f"  Aggregated O3    : {aggregated['o3']['weighted_avg']} ppb")
+    print(f"  Nodes received  : {len(readings)} / {EXPECTED_CLIENTS}")
+    print(f"  Naive AQI       : {naive_aqi}  ({aqi_category(naive_aqi)})  ← no filtering")
+    print(f"  Consensus AQI   : {city.get('consensus_aqi', 'N/A')}  ({city.get('aqi_category', 'N/A')})")
+    print(f"  Round latency   : {latency_ms} ms")
+
+    # Tier 1 table
+    print(f"\n  {'─'*66}")
+    print(f"  TIER 1 — INTRA-ZONE AGGREGATION & BFT")
+    print(f"  {'─'*66}")
+    print(f"  {'Zone':<22} {'Node1 PM2.5':>11} {'Node2 PM2.5':>11} {'|Δ|':>7} "
+          f"{'Zone PM2.5':>11} {'Conf':>5}  Status")
+    print(f"  {'-'*22} {'-'*11} {'-'*11} {'-'*7} {'-'*11} {'-'*5}  {'-'*10}")
+
+    for zr in zone_results:
+        nids = zr["node_ids"]
+        v    = [readings[n]["pm25"] if n in readings else None for n in nids]
+        va   = f"{v[0]:.2f}" if v[0] is not None else "  N/A"
+        vb   = f"{v[1]:.2f}" if v[1] is not None else "  N/A"
+        diff = f"{zr['intra_pm25_diff']:.2f}" if zr["intra_pm25_diff"] is not None else "  N/A"
+        zpm  = f"{zr['zone_pm25']:.2f}" if zr["zone_pm25"] is not None else "  N/A"
+        conf = f"{zr['confidence']:.1f}"
+        stat_map = {"ok": "✓ OK", "degraded": "⚠ DEGRADED", "no_data": "✗ NO DATA"}
+        stat = stat_map[zr["status"]]
+        print(f"  {zr['zone']:<22} {va:>11} {vb:>11} {diff:>7} {zpm:>11} {conf:>5}  {stat}")
+
+    # Tier 2 table
+    print(f"\n  {'─'*66}")
+    print(f"  TIER 2 — INTER-ZONE BFT")
+    print(f"  {'─'*66}")
+    if byzantine_zone_names:
+        print(f"  ⚠  Byzantine zones dropped : {byzantine_zone_names}")
+    else:
+        print(f"  ✓  All zones passed inter-zone BFT — no zones dropped")
+    trusted_zone_names = [z["zone"] for z in trusted_zones]
+    print(f"  Trusted zones              : {trusted_zone_names}")
+
+    # City-wide result
+    print(f"\n  {'─'*66}")
+    print(f"  CITY-WIDE DISTRIBUTED AGGREGATION")
+    print(f"  {'─'*66}")
+    if city:
+        print(f"  PM2.5  : {city['pm25']} µg/m³")
+        print(f"  CO     : {city['co']} ppm")
+        print(f"  NO2    : {city['no2']} ppb")
+        print(f"  O3     : {city['o3']} ppb")
+        print(f"  AQI    : {city['consensus_aqi']}  → {city['aqi_category']}")
+    else:
+        print(f"  [!] No trusted zones — cannot produce city-wide AQI")
     print(sep)
 
-    # ── Step 5: Build response and broadcast ─────────────────────────────────
+    # ── Broadcast to all clients ──────────────────────────────────────────────
     response = {
-        "round_id":          round_id,
-        "consensus_aqi":     aggregated["consensus_aqi"],
-        "aqi_category":      aggregated["aqi_category"],
-        "aggregated":        aggregated,
-        "byzantine_nodes":   byzantine_ids,
-        "naive_aqi":         naive_aqi,
-        "latency_ms":        latency_ms,
-        "node_deviations":   {str(k): v for k, v in node_deviations.items()},
+        "round_id":        round_id,
+        "naive_aqi":       naive_aqi,
+        "consensus_aqi":   city.get("consensus_aqi"),
+        "aqi_category":    city.get("aqi_category"),
+        "city_aggregated": city,
+        "zone_results":    [{k: v for k, v in zr.items()} for zr in zone_results],
+        "byzantine_zones": byzantine_zone_names,
+        "latency_ms":      latency_ms,
     }
 
     payload = json.dumps(response) + "\n"
@@ -231,7 +320,7 @@ def run_consensus_round(round_id: int):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def handle_client(conn: socket.socket, client_id: int):
-    print(f"[SERVER] Node-{client_id} connected.")
+    print(f"[SERVER] Node-{client_id} connected  ({ZONE_MAP.get(client_id, 'unknown')})")
     buffer = ""
     try:
         while True:
@@ -257,21 +346,18 @@ def handle_client(conn: socket.socket, client_id: int):
                         round_data[round_id] = {}
                         round_events[round_id] = threading.Event()
                     round_data[round_id][client_id] = msg
-
-                    count = len(round_data[round_id])
-                    print(f"[SERVER] Round {round_id}: received from Node-{client_id} "
-                          f"(PM2.5={msg['pm25']:.2f})  [{count}/{EXPECTED_CLIENTS}]")
-
+                    count = len([k for k in round_data[round_id] if k != "_done"])
+                    print(f"[SERVER] Round {round_id}: Node-{client_id} "
+                          f"PM2.5={msg['pm25']:.2f}  [{count}/{EXPECTED_CLIENTS}]")
                     if count == EXPECTED_CLIENTS:
                         round_events[round_id].set()
 
-                # Wait until all clients have reported for this round
-                round_events[round_id].wait(timeout=15)
+                round_events[round_id].wait(timeout=20)
 
-                # Only the last-arriving thread triggers consensus
                 with lock:
                     already_done = round_data[round_id].get("_done", False)
-                    if not already_done and len(round_data[round_id]) >= EXPECTED_CLIENTS:
+                    count_now = len([k for k in round_data[round_id] if k != "_done"])
+                    if not already_done and count_now >= EXPECTED_CLIENTS:
                         round_data[round_id]["_done"] = True
                         trigger = True
                     else:
@@ -299,7 +385,8 @@ def main():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen(10)
-    print(f"[SERVER] AQI Monitoring Server listening on {HOST}:{PORT}")
+    print(f"[SERVER] AQI Monitoring Server  {HOST}:{PORT}")
+    print(f"[SERVER] Zones  : {list(ZONES.keys())}")
     print(f"[SERVER] Waiting for {EXPECTED_CLIENTS} sensor nodes...\n")
 
     try:
